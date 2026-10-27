@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import dataclasses
 import gc
+import json
 import logging
 import time
 from typing import AsyncGenerator
@@ -2830,3 +2831,74 @@ async def test_stream_whose_last_chunk_finishes_keeps_its_chunks(
       "Oslo is ",
       "4C and cloudy.",
   ]
+
+
+@pytest.mark.asyncio
+async def test_interrupted_stream_propagates_error_and_keeps_partial_messages(
+    telemetry: _Telemetry, monkeypatch: pytest.MonkeyPatch
+):
+  monkeypatch.setenv(
+      "OTEL_SEMCONV_STABILITY_OPT_IN", "gen_ai_latest_experimental"
+  )
+  monkeypatch.setenv(
+      "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "SPAN_ONLY"
+  )
+  ctx = await _invocation_context(_agent())
+  event = mock.MagicMock()
+  event.id = "interrupted-test"
+  failure = ConnectionError("before aggregate")
+  with pytest.raises(ConnectionError) as caught:
+    async with _instrumentation.record_inference_telemetry(
+        LlmRequest(model="some-model"), ctx, event
+    ) as scope:
+      scope.record_llm_response(ctx, _text_chunk("partial text"))
+      raise failure
+  assert caught.value is failure
+  span = telemetry.only_span()
+  messages = json.loads(span.attributes["gen_ai.output.messages"])
+  assert [m["parts"][0]["content"] for m in messages] == ["partial text"]
+  assert span.status.status_code == StatusCode.ERROR
+
+
+@pytest.mark.asyncio
+async def test_aggregate_is_recorded_once_in_completion_event(
+    telemetry: _Telemetry, monkeypatch: pytest.MonkeyPatch
+):
+  del telemetry
+  monkeypatch.setenv(
+      "OTEL_SEMCONV_STABILITY_OPT_IN", "gen_ai_latest_experimental"
+  )
+  monkeypatch.setenv(
+      "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "EVENT_ONLY"
+  )
+  logs = InMemoryLogRecordExporter()
+  install_telemetry(
+      monkeypatch, InMemorySpanExporter(), logs, InMemoryMetricReader()
+  )
+  ctx = await _invocation_context(_agent())
+  event = mock.MagicMock()
+  event.id = "completion-event-test"
+  async with _instrumentation.record_inference_telemetry(
+      LlmRequest(model="some-model"), ctx, event
+  ) as scope:
+    scope.record_llm_response(ctx, _text_chunk("hello "))
+    scope.record_llm_response(ctx, _text_chunk("world"))
+    scope.record_llm_response(
+        ctx,
+        _llm_response(
+            content=types.Content(
+                role="model", parts=[types.Part(text="hello world")]
+            ),
+            partial=False,
+        ),
+    )
+  records = [
+      r.log_record
+      for r in logs.get_finished_logs()
+      if "gen_ai.output.messages" in (r.log_record.attributes or {})
+  ]
+  assert len(records) == 1
+  messages = records[0].attributes["gen_ai.output.messages"]
+  if isinstance(messages, str):
+    messages = json.loads(messages)
+  assert [m["parts"][0]["content"] for m in messages] == ["hello world"]
